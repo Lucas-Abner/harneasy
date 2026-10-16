@@ -19,3 +19,7 @@ def active_todo():
         if t['status'] == 'in_progress':
             return t
     return 'thinking...'
+
+
+def has_open_todos():
+    return any(t['status'] in {'pending', 'in_progress'} for t in TODOS)

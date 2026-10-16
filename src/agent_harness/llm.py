@@ -7,7 +7,7 @@ from .tools import TOOLS_SCHEMAS
 load_dotenv()
 
 client = OpenAI(
-    base_url=os.getenv("OPENAI_API_BASE"),
+    #base_url=os.getenv("OPENAI_API_BASE"),
     api_key=os.getenv("OPENAI_API_KEY")
 )
 

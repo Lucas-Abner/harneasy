@@ -1,5 +1,11 @@
 import subprocess
+import json
 from .skills import read_skill
+from .todos import write_todos
+from .permissions import check
+from .subagents import TASK_SCHEMA, task
+from .sandbox import run as sandbox_run
+
 
 def bash(command):
     windows = False
@@ -16,13 +22,7 @@ def bash(command):
         )
         return result.stdout + result.stderr
     else:
-        result = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-        )
+        result = sandbox_run(command)
         return result.stdout + result.stderr
 
 def read_file(path: str) -> str:
@@ -56,6 +56,27 @@ def str_replace(path: str, old: str, new: str, allow_multi_edit: bool = False):
 
     return f'Substituído {count} ocorrências de em {path}'
 
+
+def update_todos(todos: list[dict[str, str]]) -> str:
+    return write_todos(todos)
+
+def execute(tool_call):
+    from .ui import ui
+
+
+    name = tool_call.function.name
+    try:
+        args = json.loads(tool_call.function.arguments)
+    except Exception as error:
+        return f"Erro ao analisar argumentos da ferramenta: {error}"
+
+    action, reason = check(name, args)
+
+    if action == 'deny':
+        return args, f"Permissão negada para executar a ferramenta {name}. Razão {reason}"
+    if action == 'ask' and not ui.confirm(reason):
+        return args, f"Permissão negada para executar a ferramenta {name}. Razão: {reason}"
+    return args, TOOLS[name](**args)
 
 TOOLS_SCHEMAS = [
     {
@@ -161,7 +182,35 @@ TOOLS_SCHEMAS = [
                 'required': ['path', 'old', 'new'],
             }
         }
-    }
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'update_todos',
+            'description': 'Atualize a lista de tarefas da sessão. Use no máximo uma tarefa in_progress.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'todos': {
+                        'type': 'array',
+                        'items': {
+                            'type': 'object',
+                            'properties': {
+                                'status': {
+                                    'type': 'string',
+                                    'enum': ['pending', 'in_progress', 'done'],
+                                },
+                                'content': {'type': 'string'},
+                            },
+                            'required': ['status', 'content'],
+                        },
+                    }
+                },
+                'required': ['todos'],
+            }
+        }
+    },
+    TASK_SCHEMA
 ]
 
 TOOLS = {
@@ -169,5 +218,7 @@ TOOLS = {
     'read_file': read_file,
     'read_skill': read_skill,
     'write_file': write_file,
-    'str_replace': str_replace
+    'str_replace': str_replace,
+    'update_todos': update_todos,
+    'task': task,
 }

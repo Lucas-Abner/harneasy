@@ -13,6 +13,11 @@ from rich.spinner import Spinner
 from rich.status import Status
 from rich.table import Table
 from rich.text import Text
+from .compact import needed, compact
+from rich.padding import Padding
+
+ACCENT = "#7aa2f7"
+MUTED = "#565f89"
 
 
 class AgentUI:
@@ -68,9 +73,20 @@ class AgentUI:
         table.add_row("directory", os.getcwd())
         self.console.print(Panel(table, title="Session", border_style="grey30"))
 
-    def thinking(self, label='thinking') -> Status:
+    def show_todos(self, content: str) -> None:
+        if content:
+            self.console.print(
+                Panel(
+                    Text(content),
+                    title="[bold bright_yellow]todo list[/bold bright_yellow]",
+                    border_style="yellow",
+                    padding=(0, 1),
+                )
+            )
+
+    def thinking(self, label: str = "thinking") -> Status:
         return self.console.status(
-            Spinner("dots", text=f" [dim]{label}[/dim]"),
+            Spinner("dots", text=Text(f" {label}", style="dim")),
             spinner_style="bright_cyan",
         )
 
@@ -90,6 +106,11 @@ class AgentUI:
     def show_error(self, error: Exception) -> None:
         self.console.print(Panel(str(error), title="[bold red]error[/bold red]", border_style="red"))
 
+    def show_usage(self, usage: dict[str, Any]) -> None:
+        formatted_usage = (" =°= ").join(f"{key.replace('_', ' ')}: {value}" for key, value in usage.items())
+        self.console.print(f'[dim]{" "*40}{formatted_usage}[/dim]')
+
+
     def goodbye(self) -> None:
         self.console.print("\n[dim]Session closed.[/dim]")
 
@@ -102,7 +123,9 @@ def run_with_ui(
     reminder: Callable[[], dict[str, str]],
     branch: str,
     model: str,
-    active_todo: Callable[[], dict[str, str] | str]
+    active_todo: Callable[[], dict[str, str] | str],
+    todos: Callable[[], str],
+    has_open_todos: Callable[[], bool],
 ) -> None:
     """Run the interactive loop while keeping orchestration outside the renderer."""
     ui = AgentUI(model=model, tool_names=list(tools))
@@ -131,13 +154,16 @@ def run_with_ui(
         messages.append({"role": "user", "content": user_input})
         while True:
             try:
-                with ui.thinking(label=active_todo):
-                    message, _, _, _ = call_llm(messages + [reminder()])
+                todo = active_todo()
+                label = todo.get("content", "thinking...") if isinstance(todo, dict) else todo
+                with ui.thinking(label=label):
+                    message, usage, _, _ = call_llm(messages + [reminder()])
                 messages.append(message.model_dump(exclude_none=True))
 
                 if message.content:
                     ui.show_agent_message(message.content)
-                if not message.tool_calls:
+                    ui.show_usage(usage)
+                if not message.tool_calls and not has_open_todos():
                     break
 
                 for tool_call in message.tool_calls:
@@ -147,6 +173,8 @@ def run_with_ui(
                     except Exception as error:
                         result = f"Tool error: {error}"
                     ui.show_tool_call(tool_call.function.name, args, result)
+                    if tool_call.function.name == "update_todos":
+                        ui.show_todos(todos())
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
@@ -155,3 +183,6 @@ def run_with_ui(
             except Exception as error:
                 ui.show_error(error)
                 break
+
+            if needed(usage):
+                messages = compact(messages)
