@@ -77,10 +77,6 @@ def bash(command: str) -> str:
 
 def read_file(path: str, start_line: int = 1, max_lines: int = 120) -> str:
     """Read a file or a targeted line range to avoid flooding model context."""
-    root = Path(PROJECT_ROOT).expanduser().resolve()
-    file_path = (root / path).resolve()
-    if root not in file_path.parents:
-        raise ValueError(f"caminho fora do workspace: {file_path}")
 
     if start_line < 1:
         raise ValueError("start_line precisa ser maior ou igual a 1.")

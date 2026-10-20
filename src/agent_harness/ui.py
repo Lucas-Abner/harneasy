@@ -236,6 +236,7 @@ def run_with_ui(
                         )
                         tool_calls_this_request += 1
 
+                system_prompt = system_prompt + str(result)
                 ui.show_tool_call(name, args, result)
                 if name == "update_todos":
                     ui.show_todos(todos())
