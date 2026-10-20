@@ -65,9 +65,9 @@ is not.
 
 def toolset():
     """Every tool except the ones a guest should not hold."""
-    from .tools import TOOL_SCHEMAS
+    from .tools import TOOLS_SCHEMAS
 
-    return [s for s in TOOL_SCHEMAS if s["function"]["name"] not in WITHHELD]
+    return [s for s in TOOLS_SCHEMAS if s["function"]["name"] not in WITHHELD]
 
 
 def task(description: str) -> str:
