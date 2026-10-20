@@ -42,7 +42,7 @@ def _bounded_output(value: Any) -> str:
 
 def bash(command: str) -> str:
     if not isinstance(command, str) or not command.strip():
-        return "Erro: o comando deve ser uma string não vazia."
+        return "Erro: o comando deve ser uma string não vazia."  
 
     timeout = int(os.getenv("HARNEASY_COMMAND_TIMEOUT", "60"))
     is_powershell = command.lstrip().lower().startswith("powershell ")
@@ -77,6 +77,11 @@ def bash(command: str) -> str:
 
 def read_file(path: str, start_line: int = 1, max_lines: int = 120) -> str:
     """Read a file or a targeted line range to avoid flooding model context."""
+    root = Path(PROJECT_ROOT).expanduser().resolve()
+    file_path = (root / path).resolve()
+    if root not in file_path.parents:
+        raise ValueError(f"caminho fora do workspace: {file_path}")
+
     if start_line < 1:
         raise ValueError("start_line precisa ser maior ou igual a 1.")
     if max_lines < 1:
