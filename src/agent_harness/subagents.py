@@ -1,138 +1,131 @@
-"""Subagents: exploration that happens somewhere else.
+"""Isolated, read-only exploration agents for repository questions."""
+from __future__ import annotations
 
-A subagent is a whole agent loop with its own message list. That list is never
-shown to the main agent and never outlives the call - the only thing that
-crosses back is the final report.
-
-That is the entire point, and it is compact.py's idea from the other end.
-Exploring a repo burns tens of thousands of tokens of tool output to produce a
-few hundred tokens of answer. compact.py throws context away after it has been
-spent; a subagent spends it somewhere that gets thrown away by design, so the
-main transcript never pays for the difference at all.
-
-Four rules, and the code below is really just these:
-
-  1. it starts from an empty history          (no memory of anything)
-  2. it holds every tool but two              (no recursion, no touching the plan)
-  3. it runs the same loop as the main agent  (nothing special happens here)
-  4. only its last message comes back         (the rest is discarded)
-"""
-
+import json
 import os
+from collections import Counter
+from typing import Any, Callable
 
-MAX_TURNS = 12  # a runaway explorer is worse than a missing answer
-
-
-# --- rule 2 -----------------------------------------------------------------
-# `task` would let a subagent spawn subagents, forever. `write_todos` writes to
-# a module global that belongs to the main agent's plan, and this one is a
-# guest in someone else's session. Everything else it gets.
-#
-# Note this is a *structural* guarantee - those tools are simply not in the
-# list it is offered, so it cannot call them. The "do not edit files" rule in
-# the prompt below is only asking nicely. To make that one structural too, add
-# write_file and str_replace to this set.
-WITHHELD = {"task", "write_todos", "str_replace", "write"}
-
+MAX_TURNS = max(1, int(os.getenv("HARNEASY_SUBAGENT_MAX_TURNS", "10")))
+MAX_TOOL_CALLS_PER_TURN = max(1, int(os.getenv("HARNEASY_SUBAGENT_MAX_TOOL_CALLS_PER_TURN", "5")))
+REPEAT_LIMIT = max(2, int(os.getenv("HARNEASY_REPEAT_TOOL_LIMIT", "3")))
+WITHHELD = {"task", "update_todos", "write_file", "str_replace"}
 
 SYSTEM_PROMPT = f"""
-You are an exploration subagent. You were given one question by a lead agent
-and you answer it. That is the whole job.
+Você é um subagente de exploração. Sua tarefa é investigar o repositório e
+retornar descobertas curtas, precisas e verificáveis. Você não deve modificar
+arquivos nem executar ações com efeitos colaterais.
 
-You cannot see the conversation that spawned you, and the lead agent cannot
-see anything you do here. Only your final message crosses back, so it has to
-stand on its own.
+Workspace: {os.getcwd()}
 
-You are working in {os.getcwd()}. Search inside it. Never search from / or
-from the home directory - that scans the whole machine and will time out.
-
-How to work:
-- Use bash, read_file and read_skill to find out what is actually true.
-  Prefer rg, grep and find to guess at where things live.
-- You are here to read and report, not to change anything. Do not write or
-  edit files, and do not run commands with side effects.
-- Search in batches. Several greps in one turn beats one grep per turn.
-- Stop as soon as you can answer. Do not keep looking to be thorough.
-
-Your final message is the entire report, and it is the only thing that costs
-the lead agent anything - so keep it short. Aim for under 150 words. Findings
-only: file paths with line numbers, names, values. No preamble, no restating
-the question, no long code blocks - cite the path and line and let the lead
-agent open it. Say plainly what you could not find; a gap is useful, a guess
-is not.
+Use bash apenas para comandos de leitura, e use read_file/read_skill quando
+necessário. Prefira buscas em lote. Não invente resultados: informe caminhos,
+nomes de funções, linhas e incertezas. Mire em menos de 150 palavras.
 """
 
 
-def toolset():
-    """Every tool except the ones a guest should not hold."""
+def toolset() -> list[dict[str, Any]]:
+    """Return schemas for the limited set of tools available to a subagent."""
     from .tools import TOOLS_SCHEMAS
 
-    return [s for s in TOOLS_SCHEMAS if s["function"]["name"] not in WITHHELD]
+    return [
+        schema for schema in TOOLS_SCHEMAS
+        if schema.get("function", {}).get("name") not in WITHHELD
+    ]
 
 
-def task(description: str) -> str:
-    """Run a fresh agent on one question and return only its final answer."""
-    # Imported inside the function, not at the top: llm imports tools, and
-    # tools imports us, so importing them up there would close the circle.
-    #from .history import fit
+def task(
+    description: str,
+    *,
+    confirm: Callable[[str], bool] | None = None,
+    reporter: Callable[[str, dict[str, Any], str], None] | None = None,
+) -> str:
+    """Run a fresh, bounded, read-only agent and return its final report."""
+    from .compact import compact, needed
     from .llm import call_llm
     from .tools import execute
-    from .ui import ui
 
-    # --- rule 1 ---
-    # Two messages. Not a copy of the caller's transcript, not a trimmed
-    # version of it, and not whatever the last subagent left behind - this
-    # list is born here and dies at the return statement.
-    messages = [
+    messages: list[dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": description},
     ]
-    ui.subagent(description)
+    last_report: str | None = None
+    seen_calls: Counter[str] = Counter()
 
-    report = None  # newest thing it has said, kept in case we run out of turns
+    if reporter:
+        reporter("subagent", {"description": description}, "Exploração iniciada em contexto isolado.")
 
-    # --- rule 3 ---
-    # Compare this with the inner loop in agent.py: call, append, run the
-    # tools, append, repeat. A subagent is not a new kind of thing. It is the
-    # loop you already have, pointed at a different list of messages.
-    for _ in range(MAX_TURNS):
-        fit(messages)  # its context can overflow too, and nobody compacts it
-
-        with ui.working("subagent exploring"):
-            message, usage = call_llm(messages, tools=toolset())
+    for turn in range(MAX_TURNS):
+        try:
+            message, usage, _, _ = call_llm(messages, tools=toolset())
+        except Exception as error:
+            if last_report:
+                return f"Subagente interrompido após erro: {type(error).__name__}: {error}\n\nDescobertas parciais:\n{last_report}"
+            return f"Erro no subagente: {type(error).__name__}: {error}"
 
         messages.append(message.model_dump(exclude_none=True))
-        ui.usage(usage)
-        report = message.content or report
+        if message.content:
+            last_report = message.content
 
-        # --- rule 4 ---
-        # No tool calls means it has stopped looking and started answering.
-        # `messages` goes out of scope on this line - every tool result it
-        # gathered, every path it explored, all of it. One string comes back.
         if not message.tool_calls:
-            return report or "(the subagent came back with nothing)"
+            return last_report or "O subagente terminou sem retornar descobertas."
 
-        for tool_call in message.tool_calls:
-            # The same executor the main loop uses, so the same permission
-            # rules and the same sandbox apply. A subagent is a second caller,
-            # not a privileged one - it is not a way around any of that.
-            args, result = execute(tool_call)
-            ui.tool(tool_call.function.name, args, result, nested=True)
+        for call_index, tool_call in enumerate(message.tool_calls):
+            name = tool_call.function.name
+            try:
+                parsed_args = json.loads(tool_call.function.arguments or "{}")
+                signature = name + ":" + json.dumps(parsed_args, sort_keys=True, ensure_ascii=False)
+            except (TypeError, json.JSONDecodeError):
+                signature = name + ":invalid-arguments"
+            seen_calls[signature] += 1
+
+            if seen_calls[signature] >= REPEAT_LIMIT:
+                args = {}
+                result = (
+                    f"Estagnação detectada: {name} repetiu a mesma chamada {seen_calls[signature]} vezes. "
+                    "Escolha uma ação diferente ou encerre com as descobertas parciais."
+                )
+                if reporter:
+                    reporter(name, args, result)
+            elif call_index >= MAX_TOOL_CALLS_PER_TURN:
+                args = {}
+                result = (
+                    f"Limite de {MAX_TOOL_CALLS_PER_TURN} chamadas de ferramenta por turno do subagente. "
+                    "Reduza o escopo e retorne as descobertas disponíveis."
+                )
+                if reporter:
+                    reporter(name, args, result)
+            else:
+                # The readonly flag is enforced by the central executor, not merely
+                # requested in the prompt or inferred from the offered schemas.
+                args, result = execute(
+                    tool_call,
+                    confirm=None,
+                    reporter=reporter,
+                    readonly=True,
+                )
+
             messages.append({
                 "role": "tool",
                 "tool_call_id": tool_call.id,
                 "content": result,
             })
 
-    # Out of turns. Hand back whatever it last managed to say rather than
-    # nothing at all - a partial finding still beats making the lead agent
-    # start the whole search again from scratch.
-    if report:
+        if needed(usage, messages):
+            try:
+                messages = compact(messages)
+            except Exception as error:
+                return (
+                    f"Subagente não conseguiu compactar o contexto: {error}. "
+                    f"Descobertas parciais: {last_report or '(nenhuma)'}"
+                )
+
+    if last_report:
         return (
-            f"(stopped after {MAX_TURNS} turns, before finishing. Partial "
-            f"findings below - narrow the question and ask again.)\n\n{report}"
+            f"Subagente atingiu o limite de {MAX_TURNS} turnos sem finalizar. "
+            f"Descobertas parciais:\n{last_report}"
         )
-    return f"(stopped after {MAX_TURNS} turns with nothing to report.)"
+    return f"Subagente atingiu o limite de {MAX_TURNS} turnos sem descobertas."
 
 
 TASK_SCHEMA = {
@@ -140,24 +133,17 @@ TASK_SCHEMA = {
     "function": {
         "name": "task",
         "description": (
-            "Hand a self-contained exploration question to a fresh agent that "
-            "has its own context window, and get back its findings. Use this "
-            "to learn how the codebase works - tracing behaviour, locating "
-            "where something is implemented, surveying files - so the search "
-            "costs you one answer instead of dozens of tool results. It cannot "
-            "see this conversation, so include every detail it needs. It reads "
-            "and reports; it never edits. Do your own editing."
+            "Delegue uma pergunta autocontida de exploração a um subagente "
+            "isolado e somente leitura. Use para localizar funcionalidades, "
+            "seguir fluxo de dados ou entender a estrutura do código. Ele não "
+            "pode editar arquivos nem chamar outros subagentes."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "description": {
                     "type": "string",
-                    "description": (
-                        "The question, written to stand alone: what to find "
-                        "out, where to start looking, and what the answer "
-                        "should contain."
-                    ),
+                    "description": "Pergunta completa, com contexto e formato esperado das descobertas.",
                 }
             },
             "required": ["description"],

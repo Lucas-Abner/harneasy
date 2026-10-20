@@ -1,7 +1,7 @@
 [project]
 name = "agent-harness"
 version = "0.1.0"
-description = "Add your description here"
+description = "Local-first coding agent harness optimized for small language models"
 readme = "README.md"
 authors = [
     { name = "Lucas-Abner", email = "lucascaixeta02@gmail.com" }
@@ -20,3 +20,6 @@ agent-harness = "agent_harness:main"
 [build-system]
 requires = ["uv_build>=0.12.1,<0.13.0"]
 build-backend = "uv_build"
+
+[tool.uv]
+link-mode = "copy"
