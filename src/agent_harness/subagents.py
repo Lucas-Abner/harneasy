@@ -6,6 +6,8 @@ import os
 from collections import Counter
 from typing import Any, Callable
 
+from .repair import parse_arguments
+
 MAX_TURNS = max(1, int(os.getenv("HARNEASY_SUBAGENT_MAX_TURNS", "10")))
 MAX_TOOL_CALLS_PER_TURN = max(1, int(os.getenv("HARNEASY_SUBAGENT_MAX_TOOL_CALLS_PER_TURN", "5")))
 REPEAT_LIMIT = max(2, int(os.getenv("HARNEASY_REPEAT_TOOL_LIMIT", "3")))
@@ -21,6 +23,8 @@ Workspace: {os.getcwd()}
 Use bash apenas para comandos de leitura, e use read_file/read_skill quando
 necessário. Prefira buscas em lote. Não invente resultados: informe caminhos,
 nomes de funções, linhas e incertezas. Mire em menos de 150 palavras.
+Se pedirem para criar ou editar arquivos, responda apenas que você não pode
+fazer isso e que o agente principal deve usar write_file ou str_replace.
 """
 
 
@@ -73,9 +77,9 @@ def task(
         for call_index, tool_call in enumerate(message.tool_calls):
             name = tool_call.function.name
             try:
-                parsed_args = json.loads(tool_call.function.arguments or "{}")
+                parsed_args = parse_arguments(tool_call.function.arguments)
                 signature = name + ":" + json.dumps(parsed_args, sort_keys=True, ensure_ascii=False)
-            except (TypeError, json.JSONDecodeError):
+            except ValueError:
                 signature = name + ":invalid-arguments"
             seen_calls[signature] += 1
 
@@ -132,19 +136,11 @@ TASK_SCHEMA = {
     "type": "function",
     "function": {
         "name": "task",
-        "description": (
-            "Delegue uma pergunta autocontida de exploração a um subagente "
-            "isolado e somente leitura. Use para localizar funcionalidades, "
-            "seguir fluxo de dados ou entender a estrutura do código. Ele não "
-            "pode editar arquivos nem chamar outros subagentes."
-        ),
+        "description": "Pesquisa somente leitura em muitos arquivos, ex: 'onde X é definido?'. NÃO cria nem edita arquivos.",
         "parameters": {
             "type": "object",
             "properties": {
-                "description": {
-                    "type": "string",
-                    "description": "Pergunta completa, com contexto e formato esperado das descobertas.",
-                }
+                "description": {"type": "string", "description": "Pergunta completa, com o contexto necessário."}
             },
             "required": ["description"],
         },

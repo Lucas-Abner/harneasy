@@ -102,6 +102,7 @@ def summarize(messages: list[dict[str, Any]]) -> str:
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": render(messages)},
             ],
+            temperature=0.2,
         )
         summary = result.choices[0].message.content
         if summary and summary.strip():

@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import Any
 
 from rich.console import Console, Group
+from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.rule import Rule
@@ -15,6 +16,10 @@ from rich.status import Status
 from rich.table import Table
 from rich.text import Text
 from .compact import needed, compact
+from .repair import parse_arguments
+from .context import verify_command
+from .skills import skill_body, suggest_skill
+from .tools import UNDO_STACK, changes_since, execute_tool, forget_reads, pending_problems
 from rich.padding import Padding
 from rich.prompt import Confirm
 
@@ -25,7 +30,7 @@ MUTED = "#565f89"
 class AgentUI:
     """Terminal interface for the agent conversation."""
 
-    def __init__(self, *, model: str, tool_names: list[str]) -> None:
+    def __init__(self, *, model: str, tool_names: list[str], auto_confirm: bool | None = None) -> None:
         if os.name == "nt":
             for stream in (sys.stdout, sys.stderr):
                 if hasattr(stream, "reconfigure"):
@@ -33,10 +38,13 @@ class AgentUI:
         self.console = Console(highlight=False, legacy_windows=False)
         self.model = model
         self.tool_names = tool_names
+        # None = ask the user; True/False = answer every permission prompt automatically (-p mode).
+        self.auto_confirm = auto_confirm
         self.commands = {
             "/help": "show available commands",
             "/clear": "clear the conversation",
             "/status": "show session and model information",
+            "/undo": "undo the agent's last file edit",
             "/exit": "leave the harness",
         }
 
@@ -100,8 +108,11 @@ class AgentUI:
             spinner_style="bright_cyan",
         )
 
+    def agent_panel(self, content: str) -> Panel:
+        return Panel(Markdown(content), border_style="bright_cyan", title="[bold bright_cyan]agent[/bold bright_cyan]", padding=(1, 2))
+
     def show_agent_message(self, content: str) -> None:
-        self.console.print(Panel(Markdown(content), border_style="bright_cyan", title="[bold bright_cyan]agent[/bold bright_cyan]", padding=(1, 2)))
+        self.console.print(self.agent_panel(content))
 
     def show_tool_call(self, name: str, args: dict[str, Any], result: str) -> None:
         rendered_args = json.dumps(args, ensure_ascii=False, indent=2)
@@ -124,94 +135,212 @@ class AgentUI:
     def confirm(self, reason: str) -> bool:
         """Ask before executing a command outside the automatic safe allowlist."""
         self.console.print(Panel(reason or "A ferramenta solicita aprovação.", title="[bold yellow]Permissão necessária[/bold yellow]", border_style="yellow"))
+        if self.auto_confirm is not None:
+            self.console.print(f"[dim]Resposta automática: {'aprovado' if self.auto_confirm else 'negado'} (use --yes para aprovar).[/dim]")
+            return self.auto_confirm
         return Confirm.ask("Autorizar esta ação?", default=False, console=self.console)
 
     def goodbye(self) -> None:
         self.console.print("\n[dim]Session closed.[/dim]")
 
 
-def run_with_ui(
+class StreamView:
+    """Show a spinner until the first token arrives, then the answer as it is written."""
+
+    def __init__(self, ui: AgentUI, label: str) -> None:
+        self.ui = ui
+        self.label = label
+        self.text = ""
+        self.live = Live(self._render(), console=ui.console, refresh_per_second=8, vertical_overflow="visible")
+
+    def _render(self):
+        if not self.text:
+            return Spinner("dots", text=Text(f" {self.label}", style="dim"), style="bright_cyan")
+        return self.ui.agent_panel(self.text)
+
+    def add(self, chunk: str) -> None:
+        self.text += chunk
+        self.live.update(self._render())
+
+    def __enter__(self) -> "StreamView":
+        self.live.start()
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        if not self.text:
+            self.live.transient = True  # remove the spinner when nothing was written
+        self.live.stop()
+
+
+EDIT_TOOLS = {"write_file", "str_replace"}
+
+INTERRUPTED_RESULT = "Execução interrompida pelo usuário antes de concluir esta ferramenta."
+
+
+def close_dangling_tool_calls(messages: list[dict[str, Any]]) -> None:
+    """Answer tool calls left unanswered by an interruption.
+
+    Chat Completions rejects an assistant tool_calls message whose ids have no
+    matching tool messages, which would break every later request.
+    """
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if message.get("role") == "assistant" and message.get("tool_calls"):
+            answered = {m.get("tool_call_id") for m in messages[index + 1:] if m.get("role") == "tool"}
+            for call in message["tool_calls"]:
+                if call.get("id") not in answered:
+                    messages.append({"role": "tool", "tool_call_id": call.get("id"), "content": INTERRUPTED_RESULT})
+            return
+        if message.get("role") != "tool":
+            return
+
+
+def nudge_for(content: str | None, open_todos: bool, todo_list: str) -> str | None:
+    """Return a reminder when the model ends its turn too early, else None."""
+    if not (content or "").strip():
+        return (
+            "<system-reminder>Sua resposta veio vazia. Continue a tarefa usando as "
+            "ferramentas ou responda ao usuário.</system-reminder>"
+        )
+    if open_todos:
+        return (
+            "<system-reminder>Ainda há tarefas abertas no plano:\n"
+            f"{todo_list}\n"
+            "Continue a próxima tarefa. Se ela não for mais necessária, marque-a "
+            "como done com update_todos e explique o motivo.</system-reminder>"
+        )
+    return None
+
+
+def run_verification(ui: AgentUI, command: str) -> str | None:
+    """Run the project's verification command. Return a reminder if it failed."""
+    result = execute_tool("bash", {"command": command}, confirm=ui.confirm)
+    ui.show_tool_call("verificação automática", {"command": command}, result)
+    cannot_run = ("No module named pytest", "no tests ran")
+    if result.startswith(("Permissão negada", "Execução de bash recusada")) or any(text in result for text in cannot_run):
+        ui.console.print("[yellow]A verificação automática não pôde ser executada.[/yellow]")
+        return None
+    failed = result.startswith("Erro") or "[processo finalizado com código" in result
+    if not failed:
+        return None
+    return (
+        f"<system-reminder>A verificação automática falhou ({command}):\n{result[-3000:]}\n"
+        "Corrija o problema e só então encerre.</system-reminder>"
+    )
+
+
+def run_request(
+    ui: AgentUI,
+    messages: list[dict[str, Any]],
+    user_input: str,
     *,
-    system_prompt: str,
     call_llm: Callable[..., tuple[Any, dict[str, Any], Any, Any]],
-    tools: dict[str, Callable[..., str]],
     reminder: Callable[[], dict[str, str]],
-    branch: str,
-    model: str,
     active_todo: Callable[[], dict[str, str] | str],
     todos: Callable[[], str],
     has_open_todos: Callable[[], bool],
-) -> None:
-    """Interactive shell with bounded turns and a single guarded tool gateway."""
+) -> tuple[list[dict[str, Any]], str]:
+    """Run one user request until the model gives its final answer.
+
+    Returns the updated messages and a status: "done", "error",
+    "interrupted" or "turn_limit".
+    """
     from collections import Counter
-    from .tools import execute_tool
 
     max_turns = max(1, int(os.getenv("HARNEASY_MAX_TURNS_PER_REQUEST", "30")))
     max_tool_calls = max(1, int(os.getenv("HARNEASY_MAX_TOOL_CALLS_PER_TURN", "8")))
     repeat_limit = max(2, int(os.getenv("HARNEASY_REPEAT_TOOL_LIMIT", "3")))
+    max_nudges = max(0, int(os.getenv("HARNEASY_MAX_NUDGES", "2")))
+    final_review = os.getenv("HARNEASY_FINAL_REVIEW", "1") not in {"0", "false", "no"}
+    auto_skills = os.getenv("HARNEASY_AUTO_SKILLS", "1") not in {"0", "false", "no"}
+    max_verifications = max(0, int(os.getenv("HARNEASY_MAX_VERIFY", "2")))
 
-    ui = AgentUI(model=model, tool_names=list(tools))
-    ui.show_welcome(cwd=os.getcwd(), branch=branch)
-    messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+    content = user_input
+    skill = suggest_skill(user_input) if auto_skills else None
+    if skill:
+        # Small models rarely read skills on their own, so the harness picks one.
+        ui.console.print(f"[dim]skill: {skill}[/dim]")
+        content += f"\n\n<skill name=\"{skill}\">\n{skill_body(skill)}\n</skill>\nSiga os passos desta skill."
+    messages.append({"role": "user", "content": content})
+    undo_mark = len(UNDO_STACK)
+    edited_paths: set[str] = set()
+    reviewed = False
+    repeated_calls: Counter[str] = Counter()
+    tool_calls_this_request = 0
+    nudges = 0
+    verifications = 0
+    files_changed = False
 
-    while True:
-        user_input = ui.prompt()
-        if not user_input:
-            continue
-        if user_input == "/exit":
-            ui.goodbye()
-            return
-        if user_input == "/help":
-            ui.command_help()
-            continue
-        if user_input == "/clear":
-            messages = [{"role": "system", "content": system_prompt}]
-            ui.console.clear()
-            ui.show_welcome(cwd=os.getcwd(), branch=branch)
-            continue
-        if user_input == "/status":
-            ui.show_status(message_count=len(messages), tool_count=len(tools))
-            continue
-
-        messages.append({"role": "user", "content": user_input})
-        repeated_calls: Counter[str] = Counter()
-        tool_calls_this_request = 0
-        finished = False
-
+    try:
         for turn in range(max_turns):
             try:
                 todo = active_todo()
                 label = todo.get("content", "thinking...") if isinstance(todo, dict) else todo
-                with ui.thinking(label=label):
-                    message, usage, _, _ = call_llm(messages + [reminder()])
+                view = StreamView(ui, label)
+                with view:
+                    env = reminder()
+                    env = {**env, "content": env["content"] + f"\nturno: {turn + 1} de {max_turns}"}
+                    message, usage, _, _ = call_llm(messages + [env], on_text=view.add)
                 messages.append(message.model_dump(exclude_none=True))
             except Exception as error:
                 ui.show_error(error)
-                finished = True
-                break
+                return messages, "error"
 
             if message.content:
-                ui.show_agent_message(message.content)
+                if not view.text:  # not streamed: show the whole answer now
+                    ui.show_agent_message(message.content)
                 ui.show_usage(usage or {})
 
             if not message.tool_calls:
+                # The model stopped too early: remind it and let it continue.
+                nudge = nudge_for(message.content, has_open_todos(), todos())
+                if nudge and nudges < max_nudges:
+                    nudges += 1
+                    messages.append({"role": "user", "content": nudge})
+                    continue
+                # From here on, the harness checks the work instead of trusting "done".
+                # 1) Problems visible without the model: bad syntax, missing modules or files.
+                problems = pending_problems(edited_paths, user_input) if edited_paths else []
+                if problems and nudges < max_nudges:
+                    nudges += 1
+                    messages.append({"role": "user", "content": (
+                        "<system-reminder>Ainda há problemas:\n- " + "\n- ".join(problems)
+                        + "\nCorrija antes de encerrar.</system-reminder>"
+                    )})
+                    continue
+                # 2) The project's tests.
+                command = verify_command()
+                if command and files_changed and verifications < max_verifications:
+                    verifications += 1
+                    files_changed = False
+                    failure = run_verification(ui, command)
+                    if failure:
+                        messages.append({"role": "user", "content": failure})
+                        continue
+                # 3) One review of the request against the real diff.
+                if final_review and edited_paths and not reviewed:
+                    reviewed = True
+                    messages.append({"role": "user", "content": (
+                        f"<system-reminder>Revisão final. O pedido foi:\n{user_input}\n\n"
+                        f"Alterações feitas (diff real):\n{changes_since(undo_mark)}\n\n"
+                        "Compare o pedido com o diff, item por item. Se faltar algo, continue usando as "
+                        "ferramentas. Se estiver completo, responda só o resumo final.</system-reminder>"
+                    )})
+                    continue
                 if has_open_todos():
                     ui.console.print(
                         "[yellow]A resposta terminou, mas ainda existem tarefas abertas no plano. "
                         "Revise a lista antes de considerar o trabalho concluído.[/yellow]"
                     )
                     ui.show_todos(todos())
-                finished = True
-                break
+                return messages, "done"
 
             reporter = lambda name, args, result: ui.show_tool_call(name, args, result)
             for call_index, tool_call in enumerate(message.tool_calls):
                 name = tool_call.function.name
                 try:
-                    args = json.loads(tool_call.function.arguments or "{}")
-                    if not isinstance(args, dict):
-                        raise ValueError("os argumentos precisam ser um objeto JSON")
-                except (TypeError, json.JSONDecodeError, ValueError) as error:
+                    args = parse_arguments(tool_call.function.arguments)
+                except ValueError as error:
                     args = {}
                     result = f"Erro ao analisar argumentos da ferramenta {name}: {error}"
                 else:
@@ -235,8 +364,13 @@ def run_with_ui(
                             reporter=reporter if name == "task" else None,
                         )
                         tool_calls_this_request += 1
+                        if name in EDIT_TOOLS and not result.startswith("Erro"):
+                            # The files changed, so running the same command again
+                            # (e.g. the tests) is progress, not a loop.
+                            repeated_calls.clear()
+                            files_changed = True
+                            edited_paths.add(args["path"])
 
-                system_prompt = system_prompt + str(result)
                 ui.show_tool_call(name, args, result)
                 if name == "update_todos":
                     ui.show_todos(todos())
@@ -249,17 +383,115 @@ def run_with_ui(
             try:
                 if needed(usage or {}, messages):
                     messages = compact(messages)
+                    forget_reads()
             except Exception as error:
                 # A summarizer failure should not destroy the active session.
                 ui.show_error(RuntimeError(f"Falha ao compactar contexto; mantendo histórico atual: {error}"))
+    except KeyboardInterrupt:
+        # Ctrl+C cancels only the current request; the session stays usable.
+        close_dangling_tool_calls(messages)
+        ui.console.print("\n[yellow]Solicitação interrompida pelo usuário.[/yellow]")
+        return messages, "interrupted"
 
-        if not finished and not has_open_todos():
-            ui.console.print(
-                f"[yellow]Limite de {max_turns} turnos atingido para esta solicitação. "
-                "O agente parou para evitar um loop infinito.[/yellow]"
-            )
-        elif not finished and has_open_todos():
-            ui.console.print(
-                f"[yellow]Limite de {max_turns} turnos atingido com tarefas pendentes. "
-                "Envie uma instrução mais específica para continuar.[/yellow]"
-            )
+    if has_open_todos():
+        ui.console.print(
+            f"[yellow]Limite de {max_turns} turnos atingido com tarefas pendentes. "
+            "Envie uma instrução mais específica para continuar.[/yellow]"
+        )
+    else:
+        ui.console.print(
+            f"[yellow]Limite de {max_turns} turnos atingido para esta solicitação. "
+            "O agente parou para evitar um loop infinito.[/yellow]"
+        )
+    return messages, "turn_limit"
+
+
+def _run_startup_check(ui: AgentUI, startup_check: Callable[[], str | None] | None) -> None:
+    if startup_check is None:
+        return
+    try:
+        with ui.thinking(label="carregando modelo..."):
+            warning = startup_check()
+    except KeyboardInterrupt:
+        warning = None
+    if warning:
+        ui.console.print(f"[yellow]{warning}[/yellow]\n")
+
+
+def run_with_ui(
+    *,
+    system_prompt: str,
+    call_llm: Callable[..., tuple[Any, dict[str, Any], Any, Any]],
+    tools: dict[str, Callable[..., str]],
+    reminder: Callable[[], dict[str, str]],
+    branch: str,
+    model: str,
+    active_todo: Callable[[], dict[str, str] | str],
+    todos: Callable[[], str],
+    has_open_todos: Callable[[], bool],
+    startup_check: Callable[[], str | None] | None = None,
+) -> None:
+    """Interactive shell: read a request, run it, repeat."""
+    ui = AgentUI(model=model, tool_names=list(tools))
+    ui.show_welcome(cwd=os.getcwd(), branch=branch)
+    _run_startup_check(ui, startup_check)
+    messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+
+    while True:
+        user_input = ui.prompt()
+        if not user_input:
+            continue
+        if user_input == "/exit":
+            ui.goodbye()
+            return
+        if user_input == "/help":
+            ui.command_help()
+            continue
+        if user_input == "/clear":
+            messages = [{"role": "system", "content": system_prompt}]
+            forget_reads()
+            ui.console.clear()
+            ui.show_welcome(cwd=os.getcwd(), branch=branch)
+            continue
+        if user_input == "/status":
+            ui.show_status(message_count=len(messages), tool_count=len(tools))
+            continue
+        if user_input == "/undo":
+            from .tools import undo_last_edit
+            result = undo_last_edit()
+            ui.console.print(f"[yellow]{result}[/yellow]")
+            # Tell the model, otherwise it keeps assuming its edit is in place.
+            messages.append({"role": "user", "content": f"<system-reminder>O usuário desfez sua última edição. {result}</system-reminder>"})
+            continue
+
+        messages, _ = run_request(
+            ui, messages, user_input,
+            call_llm=call_llm, reminder=reminder, active_todo=active_todo,
+            todos=todos, has_open_todos=has_open_todos,
+        )
+
+
+def run_headless(
+    prompt: str,
+    *,
+    system_prompt: str,
+    call_llm: Callable[..., tuple[Any, dict[str, Any], Any, Any]],
+    tools: dict[str, Callable[..., str]],
+    reminder: Callable[[], dict[str, str]],
+    model: str,
+    active_todo: Callable[[], dict[str, str] | str],
+    todos: Callable[[], str],
+    has_open_todos: Callable[[], bool],
+    approve_all: bool = False,
+    startup_check: Callable[[], str | None] | None = None,
+) -> int:
+    """Run a single request without prompts (-p mode). Returns a process exit code."""
+    ui = AgentUI(model=model, tool_names=list(tools), auto_confirm=approve_all)
+    _run_startup_check(ui, startup_check)
+    messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+    _, status = run_request(
+        ui, messages, prompt,
+        call_llm=call_llm, reminder=reminder, active_todo=active_todo,
+        todos=todos, has_open_todos=has_open_todos,
+    )
+    return 0 if status == "done" else 1

@@ -1,48 +1,91 @@
+import argparse
 import os
+import sys
 
 from .context import git_branch, reminder
-from .llm import call_llm
+from .permissions import PROJECT_ROOT
+from . import compact
+from .llm import call_llm, ollama_context_length
 from .skills import skills_prompt
 from .tools import TOOLS
-from .ui import run_with_ui
+from .ui import run_headless, run_with_ui
 from .todos import active_todo, has_open_todos, todos_prompts
 
+MAX_AGENTS_MD_CHARS = 4000
 
-SYSTEM_PROMPT = f"""Você é o Harneasy, um agente de programação que trabalha no workspace indicado abaixo.
-Seu objetivo é concluir a tarefa solicitada com alterações pequenas, corretas e verificadas.
 
-REGRAS DE TRABALHO
-1. Leia o código real antes de editá-lo. Não invente arquivos, APIs ou resultados.
-2. Para tarefas com várias etapas, use `update_todos` antes de começar. Mantenha uma tarefa `in_progress` por vez e atualize a lista à medida que avançar.
-3. Use `bash` para inspeção e testes, `read_file` para ler arquivos/trechos e `write_file` ou `str_replace` para editar.
-4. Para rastrear uma arquitetura ou localizar uma implementação entre vários arquivos, delegue uma pergunta autocontida à ferramenta `task`. O subagente é somente leitura; você é responsável por qualquer edição.
-5. Após editar, verifique o resultado com testes ou comandos pertinentes. Leia o código de saída e a mensagem de erro; não afirme sucesso sem evidência.
-6. Não repita uma chamada idêntica que não produziu progresso. Reavalie a hipótese e tente uma abordagem diferente.
-7. Comandos podem pedir aprovação ou ser bloqueados. Não tente contornar a política de segurança.
-8. Saídas extensas mostram uma prévia e um caminho temporário. Use `read_file` com `start_line` e `max_lines` para consultar trechos específicos.
-9. Se uma skill corresponder à tarefa, leia-a com `read_skill` antes de agir.
-10. Informe claramente o que foi concluído, o que foi verificado e o que permaneceu pendente.
+def project_instructions() -> str:
+    """Load AGENTS.md from the project root, like CLAUDE.md in Claude Code."""
+    path = PROJECT_ROOT / "AGENTS.md"
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    if len(text) > MAX_AGENTS_MD_CHARS:
+        text = text[:MAX_AGENTS_MD_CHARS] + "\n[AGENTS.md reduzido]"
+    return f"\nINSTRUÇÕES DO PROJETO (AGENTS.md)\n{text}\n"
 
-WORKSPACE: {os.getcwd()}
 
+SYSTEM_PROMPT = f"""Você é o Harneasy, um agente de programação. Conclua a tarefa com alterações pequenas, corretas e verificadas.
+
+REGRAS
+1. Leia o código antes de editar. Nunca invente arquivos, APIs ou resultados.
+2. Para achar código por assunto use search_code; por texto exato, grep; para ver a estrutura, code_map. Leia com read_file; edite com str_replace ou write_file; teste com bash.
+3. Em tarefas com várias etapas, use update_todos e mantenha uma tarefa in_progress por vez.
+4. Para explorar muitos arquivos, delegue uma pergunta completa à ferramenta task.
+5. Depois de editar, verifique com testes ou comandos. Não afirme sucesso sem evidência.
+6. Se uma chamada falhar, leia o erro e mude a abordagem; não repita a mesma chamada.
+7. Não tente contornar permissões negadas.
+8. Se uma skill corresponder à tarefa, leia-a com read_skill.
+9. Seja direto: não anuncie o que vai fazer, chame a ferramenta. Não peça confirmação para passos óbvios.
+10. No fim, responda em poucas linhas: o que foi feito, como foi verificado e o que ficou pendente.
+
+WORKSPACE: {PROJECT_ROOT}
+{project_instructions()}
 Skills disponíveis:
 {skills_prompt()}
 """
 
 
-def main() -> None:
-    """Start the interactive agent harness."""
-    run_with_ui(
+def check_context_window() -> str | None:
+    """Clamp the compaction window to the context Ollama really allocated."""
+    model = os.getenv("OPENAI_MODEL", "ornith-1.5:9b")
+    detected = ollama_context_length(model)
+    configured = compact.CONTEXT_WINDOWS
+    if detected is None or detected >= configured:
+        return None
+    compact.CONTEXT_WINDOWS = detected
+    return (
+        f"HARNEASY_CONTEXT_WINDOW={configured}, mas o Ollama alocou {detected} tokens para {model}; "
+        f"o excedente seria truncado em silêncio. Usando {detected} para a compactação. "
+        "Para ampliar, reinicie o Ollama com OLLAMA_CONTEXT_LENGTH=<tokens>."
+    )
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="agent-harness", description="Agente de programação para modelos locais.")
+    parser.add_argument("-p", "--prompt", help="executa uma única solicitação sem modo interativo e encerra")
+    parser.add_argument("--yes", action="store_true", help="no modo -p, aprova ações que pediriam confirmação")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Start the interactive agent harness, or run one request with -p."""
+    args = parse_args(argv)
+    shared = dict(
         system_prompt=SYSTEM_PROMPT,
         call_llm=call_llm,
         tools=TOOLS,
         reminder=reminder,
-        branch=git_branch(),
         model=os.getenv("OPENAI_MODEL", "ornith-1.5:9b"),
         active_todo=active_todo,
         todos=todos_prompts,
         has_open_todos=has_open_todos,
+        startup_check=check_context_window,
     )
+    if args.prompt:
+        sys.exit(run_headless(args.prompt, approve_all=args.yes, **shared))
+    run_with_ui(branch=git_branch(), **shared)
 
 
 if __name__ == "__main__":

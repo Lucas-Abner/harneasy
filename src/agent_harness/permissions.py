@@ -519,6 +519,14 @@ def check(name: str, args: dict) -> tuple[str, str | None]:
             return "deny", f"refusing to modify a file outside workspace: {resolved}"
         return "allow", None
 
+    if name in {"grep", "glob", "list_dir", "code_map", "search_code"}:
+        raw_path = args.get("path") or "."
+        if not isinstance(raw_path, str):
+            return "deny", "invalid search path"
+        if inside_project(raw_path):
+            return "allow", None
+        return "ask", f"search outside workspace: {resolve_path(raw_path)}"
+
     if name in {"read_skill", "update_todos", "task"}:
         return "allow", None
 

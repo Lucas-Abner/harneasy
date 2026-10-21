@@ -57,6 +57,40 @@ def todos_note() -> str:
     return f"\n<todos>\n{plan}\n</todos>" if plan else ""
 
 
+def verify_command() -> str:
+    """The command the harness runs to check the work, or "" for none.
+
+    HARNEASY_VERIFY_COMMAND wins; "off" disables it. Otherwise, a project
+    with tests is checked with pytest. Evaluated when the agent finishes, so
+    tests created during the request count too.
+    """
+    configured = os.getenv("HARNEASY_VERIFY_COMMAND", "").strip()
+    if configured.lower() == "off":
+        return ""
+    if configured:
+        return configured
+    has_tests = (PROJECT_ROOT / "tests").is_dir() or any(PROJECT_ROOT.glob("test_*.py"))
+    return "python -m pytest -q" if has_tests else ""
+
+
+PLAN_FILE = "PLANO.md"
+
+
+def plan_note() -> str:
+    """Point the model at the next step of PLANO.md, which survives compaction."""
+    try:
+        lines = (PROJECT_ROOT / PLAN_FILE).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ""
+    steps = [line.strip() for line in lines if line.strip().startswith(("- [ ]", "- [x]", "- [X]"))]
+    if not steps:
+        return ""
+    pending = [step[len("- [ ]"):].strip() for step in steps if step.startswith("- [ ]")]
+    done = len(steps) - len(pending)
+    next_step = f" Próxima etapa: {pending[0][:200]}" if pending else " Todas as etapas concluídas."
+    return f"\n{PLAN_FILE}: {done}/{len(steps)} etapas concluídas.{next_step}"
+
+
 def reminder() -> dict[str, str]:
     changed = states_file()
     changed_note = "\nArquivos lidos e alterados desde então: " + ", ".join(changed) if changed else ""
@@ -68,6 +102,7 @@ def reminder() -> dict[str, str]:
             f"workspace: {PROJECT_ROOT}\n"
             f"git branch: {git_branch() or 'indisponível'}\n"
             "</env>"
+            + plan_note()
             + todos_note()
             + changed_note
         ),
