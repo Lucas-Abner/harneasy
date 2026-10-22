@@ -137,6 +137,27 @@ class DefaultVerifyTests(unittest.TestCase):
         with mock.patch("agent_harness.ui.execute_tool", return_value=output):
             self.assertIsNone(run_verification(fake_ui(), "python -m pytest -q"))
 
+    def test_finishing_after_failing_tests_is_refused(self):
+        failing = "1 failed, 1 passed\n[processo finalizado com código 1]"
+        steps = [("bash", {"command": "python -m pytest -q"}), None, None, None]
+        with mock.patch("agent_harness.ui.execute_tool", return_value=failing):
+            messages, _ = run_with(scripted_llm(steps), "corrija os testes", HARNEASY_FINAL_REVIEW="0")
+        self.assertEqual(len(reminders(messages, "testes falhou")), 2)  # insists twice, then gives up
+
+    def test_wandering_without_progress_is_stopped(self):
+        steps = [("bash", {"command": f"echo {i}"}) for i in range(20)]
+        with mock.patch("agent_harness.ui.execute_tool", return_value="ok"):
+            messages, status = run_with(scripted_llm(steps), "tarefa", HARNEASY_IDLE_LIMIT="3")
+        self.assertEqual(status, "stuck")
+        self.assertEqual(len(reminders(messages, "sem editar arquivos")), 1)
+        self.assertEqual(messages[-1]["role"], "tool")  # history is valid: every call has its result
+
+    def test_repeated_call_is_reported(self):
+        steps = [("bash", {"command": "echo oi"})] * 3 + [None]
+        with mock.patch("agent_harness.ui.execute_tool", return_value="oi"):
+            messages, _ = run_with(scripted_llm(steps), "tarefa", HARNEASY_FINAL_REVIEW="0")
+        self.assertIn("estagnação", [m for m in messages if m["role"] == "tool"][-1]["content"])
+
 
 if __name__ == "__main__":
     unittest.main()

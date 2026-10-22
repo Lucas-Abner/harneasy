@@ -481,8 +481,14 @@ def decide(command: str, *, readonly: bool = False, _depth: int = 0) -> str:
 def resolve_path(path: str | os.PathLike[str]) -> Path:
     candidate = Path(path).expanduser()
     if not candidate.is_absolute():
-        candidate = PROJECT_ROOT / candidate
-    return candidate.resolve()
+        return (PROJECT_ROOT / candidate).resolve()
+    candidate = candidate.resolve()
+
+    if not candidate.exists() and PROJECT_ROOT not in candidate.parents:
+        inside = (PROJECT_ROOT / str(path).lstrip('/')).resolve()
+        if PROJECT_ROOT in inside.parents and (inside.exists() or inside.parent.is_dir()):
+            return inside
+    return candidate
 
 
 def inside_project(path: str | os.PathLike[str]) -> bool:

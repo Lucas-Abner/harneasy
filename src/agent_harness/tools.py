@@ -8,6 +8,7 @@ import inspect
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -22,10 +23,12 @@ from .codeindex import code_map, search_code, walk_files
 from .context import SEEN, note_read
 from .permissions import PROJECT_ROOT, check, decide, register_generated_output
 from .repair import parse_arguments
+from . import sandbox
 from .sandbox import run as sandbox_run
 from .skills import read_skill
 from .todos import write_todos
 from .subagents import TASK_SCHEMA, task
+from .permissions import resolve_path
 
 MAX_TOOL_OUTPUT_CHARS = max(1000, int(os.getenv("HARNEASY_MAX_TOOL_OUTPUT_CHARS", "6000")))
 
@@ -52,11 +55,65 @@ def _bounded_output(value: Any) -> str:
     return text[:head_size] + marker + (text[-tail_size:] if tail_size else "")
 
 
+def _file_read_by(command: str) -> tuple[str, int] | None:
+    if any(symbal in command for symbal in "|;&<>$`"):
+        return None
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return None
+    if not parts or parts[0] not in {'cat', 'head', 'sed'}:
+        return None
+
+    words = [part for part in parts[1:] if not part.startswith('-') and not part.isdigit()]
+    start = 1
+    if parts[0] == 'sed':
+        if not words:
+            return None
+        script, words = words[0], words[1:]
+        match = re.match(r'(\d+)', script)
+        start = int(match.group(1)) if match else 1
+    return (words[0], start) if len(words) == 1 else None
+
+INSTALL = r"\b(npm|pnpm|yarn)\s+(install|i|add|ci)\b|\bnpx\b|\bpip3?\s+install\b|\buv\s+(add|sync|pip\s+install)\b"
+GLOBAL_INSTALL = r"\b(npm|pnpm|yarn)\s+(install|i|add)\b.*\s(-g|--global)\b|\bpip3?\s+install\b.*\s--user\b"
+
+
+def _impossible_command(command: str) -> str | None:
+    """Explain why a command cannot work here, instead of letting the model retry it."""
+    reason = None
+    if re.search(r"\bnohup\b|&\s*$|&\s*\n", command):
+        reason = "processos em segundo plano não são suportados. Rode o comando normalmente"
+    elif re.search(GLOBAL_INSTALL, command):
+        reason = "instale só dentro do projeto (sem -g ou --user)"
+    elif re.search(INSTALL, command) and not sandbox.network_enabled():
+        reason = (
+            "a rede está desligada (HARNEASY_SANDBOX_NETWORK=0), então instalar pacotes "
+            "não funciona. Use só o que já está instalado"
+        )
+    elif re.search(r"\bgit\s+clone\b|\bapt(-get)?\b", command):
+        reason = "este comando não é permitido aqui"
+    if reason is None:
+        return None
+    return (
+        f"Erro: {reason}. Não tente variações deste comando. Se não for possível "
+        "verificar algo neste ambiente, diga isso na resposta final e encerre."
+    )
+
+
 def bash(command: str) -> str:
     if not isinstance(command, str) or not command.strip():
         return "Erro: o comando deve ser uma string não vazia."  
+    read = _file_read_by(command)
 
+    if read:
+        notice = _repeated_read_notice({'path': read[0], 'start_line': read[1]})
+        if notice:
+            return notice
+                
     timeout = int(os.getenv("HARNEASY_COMMAND_TIMEOUT", "60"))
+    if re.search(INSTALL, command):
+        timeout = max(timeout, 300)  # downloads are slow; 60s killed npm install
     is_powershell = command.lstrip().lower().startswith("powershell ")
     if os.name == "nt":
         if os.getenv("HARNEASY_REQUIRE_SANDBOX", "0").lower() in {"1", "true", "yes"}:
@@ -95,10 +152,7 @@ def read_file(path: str, start_line: int = 1, max_lines: int = 120) -> str:
     if max_lines < 1:
         raise ValueError("max_lines precisa ser maior ou igual a 1.")
     max_lines = min(max_lines, 500)
-    resolved = Path(path).expanduser()
-    if not resolved.is_absolute():
-        resolved = PROJECT_ROOT / resolved
-    resolved = resolved.resolve()
+    resolved = resolve_path(path)
     selected: list[str] = []
     total_lines = 0
     range_end = start_line + max_lines - 1
@@ -125,10 +179,8 @@ def is_generated_output_path(path: str | os.PathLike[str]) -> bool:
 
 
 def _resolve(path: str) -> Path:
-    resolved = Path(path).expanduser()
-    if not resolved.is_absolute():
-        resolved = PROJECT_ROOT / resolved
-    return resolved.resolve()
+    return resolve_path(path)
+
 
 
 # Every edit saves (file, previous content) here so /undo can restore it.
@@ -144,7 +196,11 @@ def _require_fresh_read(resolved: Path) -> str | None:
         return None
     read_mtime = SEEN.get(str(resolved))
     if read_mtime is None:
-        return f"Erro: leia {resolved} com read_file antes de editá-lo."
+        content = read_file(str(resolved))
+        return (
+            f"Erro: você ainda não tinha lido {resolved}; edição não aplicada. "
+            f"Conteúdo atual abaixo. Confira e REPITA a mesma chamada.\n{content}"
+            )
     if resolved.stat().st_mtime > read_mtime:
         return f"Erro: {resolved} mudou desde a última leitura. Leia-o novamente antes de editar."
     return None
@@ -196,10 +252,11 @@ def _syntax_warning(resolved: Path) -> str:
         if suffix == ".py":
             missing = _missing_imports(ast.parse(text, filename=str(resolved)), resolved)
             if missing:
-                return (
-                    f"\n[Aviso: módulos não instalados: {', '.join(missing)}. Não há rede para instalá-los; "
-                    "use a biblioteca padrão.]"
+                advice = (
+                    "instale com `uv add` se precisar deles" if sandbox.network_enabled()
+                    else "não há rede para instalá-los; use a biblioteca padrão"
                 )
+                return f"\n[Aviso: módulos não instalados: {', '.join(missing)}. {advice[0].upper()}{advice[1:]}.]"
         elif suffix == ".json":
             json.loads(text)
         elif suffix in {".yaml", ".yml"}:
@@ -566,21 +623,31 @@ def forget_reads() -> None:
 
 
 def _repeated_read_notice(args: dict[str, Any]) -> str | None:
-    """Return a short notice instead of re-sending a file the model just read."""
+    """Stop the model from reading the same unchanged lines again and again."""
     path = str(_resolve(args["path"]))
-    key = (path, args.get("start_line", 1), args.get("max_lines", 120))
+    start = args.get("start_line", 1)
+    end = start + args.get("max_lines", 120) - 1
     try:
         mtime = Path(path).stat().st_mtime
     except OSError:
         return None
-    if RECENT_READS.get(key) == mtime:
-        del RECENT_READS[key]  # if the model asks once more, send the content
+    seen_mtime, ranges, repeats = RECENT_READS.get(path, (None, [], 0))
+    if seen_mtime != mtime:
+        RECENT_READS[path] = (mtime, [(start, end)], 0)  # first read, or the file changed
+        return None
+    if not any(first <= start <= last for first, last in ranges):
+        ranges.append((start, end))  # a new part of the file: paging is fine
+        return None
+    repeats += 1
+    RECENT_READS[path] = (mtime, ranges, repeats)
+    if repeats == 1:
         return (
-            f"[Você já leu {path} (linhas {key[1]}-{key[1] + key[2] - 1}) e o arquivo não mudou. "
-            "O conteúdo está acima na conversa. Continue a tarefa.]"
+            f"[Você já leu {path} (a partir da linha {start}) e ele não mudou. O conteúdo está acima "
+            "na conversa. Use o que já leu e faça a próxima ação (editar, rodar, ou responder).]"
         )
-    RECENT_READS[key] = mtime
-    return None
+    if repeats >= 3:
+        return f"[{path} já foi lido várias vezes sem mudar. Não leia de novo: edite-o ou encerre.]"
+    return None  # 2nd repeat: send it, the old content may have scrolled too far
 
 
 def execute_tool(
@@ -609,6 +676,12 @@ def execute_tool(
         inspect.signature(function).bind(**args)
     except TypeError as error:
         return f"Erro nos argumentos da ferramenta {name}: {error}"
+
+    if name == "bash":
+        # Checked before asking permission: the user should not approve what cannot work.
+        impossible = _impossible_command(args["command"])
+        if impossible:
+            return impossible
 
     action, reason = check(name, args)
     if name == "bash" and readonly:

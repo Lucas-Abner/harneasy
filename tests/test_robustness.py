@@ -6,9 +6,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from agent_harness import agent, compact, llm
+from agent_harness import agent, compact, llm, sandbox
 from agent_harness.permissions import PROJECT_ROOT
-from agent_harness.tools import coerce_args, execute_tool
+from agent_harness.tools import _impossible_command, coerce_args, execute_tool
 from agent_harness.ui import INTERRUPTED_RESULT, close_dangling_tool_calls
 
 
@@ -42,6 +42,34 @@ class ArgumentCoercionTests(unittest.TestCase):
             Path(handle.name).unlink()
         self.assertIn("linhas 2-2 de 3", result)
         self.assertIn("dois", result)
+
+
+class NetworkTests(unittest.TestCase):
+    def test_install_is_refused_with_a_reason_when_network_is_off(self):
+        with mock.patch.dict(os.environ, {"HARNEASY_SANDBOX_NETWORK": "0"}):
+            self.assertIn("rede está desligada", execute_tool("bash", {"command": "npm install jsdom"}))
+            self.assertIsNone(_impossible_command("node --check js/app.js"))
+
+    def test_install_is_possible_but_only_inside_the_project_when_network_is_on(self):
+        with mock.patch.dict(os.environ, {"HARNEASY_SANDBOX_NETWORK": "1"}):
+            self.assertIsNone(_impossible_command("npm install jsdom"))
+            self.assertIn("dentro do projeto", _impossible_command("npm install -g jsdom"))
+            self.assertIn("dentro do projeto", _impossible_command("pip install requests --user"))
+
+    def test_background_processes_are_refused(self):
+        for command in ["nohup npm start &", "python server.py &"]:
+            with self.subTest(command=command):
+                self.assertIn("segundo plano", _impossible_command(command))
+        self.assertIsNone(_impossible_command("make test && echo ok"))
+
+    def test_bubblewrap_shares_network_only_when_enabled(self):
+        with mock.patch.object(sandbox.sys, "platform", "linux"), \
+                mock.patch.object(sandbox.shutil, "which", return_value="/usr/bin/bwrap"):
+            with mock.patch.dict(os.environ, {"HARNEASY_SANDBOX_NETWORK": "0"}):
+                self.assertIn("--unshare-net", sandbox.wrap("true"))
+            with mock.patch.dict(os.environ, {"HARNEASY_SANDBOX_NETWORK": "1"}), \
+                    mock.patch.object(sandbox, "CACHE_DIRS", []):
+                self.assertNotIn("--unshare-net", sandbox.wrap("true"))
 
 
 class InterruptionTests(unittest.TestCase):

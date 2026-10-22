@@ -11,7 +11,9 @@ triggers:
 ---
 # Iniciar um projeto web simples
 
-Sem rede: não use npm install nem CDNs. Escreva HTML, CSS e JavaScript puros.
+Escreva HTML, CSS e JavaScript puros, sem CDNs. Veja a linha `rede:` do `<env>`:
+com a rede desligada não use npm install; com ela ligada, instale só o que a
+tarefa precisa, dentro do projeto (`npm install pacote`, nunca `-g`).
 
 ## Estrutura
 ```
@@ -43,7 +45,10 @@ README.md
 2. CSS: variáveis em `:root` para cores e espaçamentos; layout com flexbox ou grid.
 3. JS: funções pequenas; o estado em um objeto; uma função `render()` que
    redesenha a tela a partir do estado; `localStorage` para salvar dados.
-4. Verifique a sintaxe do JS com `node --check js/app.js` (se o node existir).
+4. **Verificação possível aqui:** `node --check js/app.js` e, para a lógica, um
+   arquivo de teste rodado com `node`. Não há navegador. Instale jsdom só se a
+   rede estiver ligada e o usuário pedir verificação do DOM; senão, diga ao
+   usuário para abrir `index.html` e encerre.
 5. Para lógica complexa, separe funções puras num arquivo e teste-as com
    `node` e `console.assert`.
 6. No README, diga para abrir `index.html` no navegador.

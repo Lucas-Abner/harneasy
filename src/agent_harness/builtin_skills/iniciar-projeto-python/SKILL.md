@@ -10,8 +10,9 @@ triggers:
 ---
 # Iniciar um projeto Python
 
-Sem rede: use apenas a biblioteca padrão. Só use um pacote externo se ele já
-estiver instalado.
+Prefira a biblioteca padrão. Com a rede desligada (linha `rede:` do `<env>`),
+só use pacotes já instalados; com ela ligada, instale no projeto com
+`uv add pacote` (nunca `pip install --user`).
 
 ## Estrutura
 ```

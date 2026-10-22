@@ -15,18 +15,31 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(os.getenv("HARNEASY_PROJECT_ROOT", Path.cwd())).expanduser().resolve()
 
+# Package managers must write their caches, even though the rest of $HOME is read-only.
+CACHE_DIRS = [Path.home() / ".npm", Path.home() / ".cache"]
+
+
+def network_enabled() -> bool:
+    """Off by default: with network, a bad package or a prompt injection can do real harm."""
+    return os.getenv("HARNEASY_SANDBOX_NETWORK", "0").lower() in {"1", "true", "yes"}
+
+
+def _escape(path: Path) -> str:
+    return str(path).replace("\\", "\\\\").replace('"', '\\"')
+
 
 def _seatbelt_profile() -> str:
-    escaped = str(PROJECT_ROOT).replace("\\", "\\\\").replace('"', '\\"')
     git_dir = PROJECT_ROOT / ".git"
     git_rule = f'(deny file-write* (subpath "{git_dir}"))' if git_dir.exists() else ""
+    network_rule = "(allow network*)" if network_enabled() else "(deny network*)"
+    cache_rules = "".join(f' (subpath "{_escape(cache)}")' for cache in CACHE_DIRS) if network_enabled() else ""
     return f'''(version 1)
 (deny default)
 (allow process-exec process-fork signal)
 (allow file-read*)
 (allow sysctl-read)
-(deny network*)
-(allow file-write* (subpath "{escaped}") (literal "/dev/null"))
+{network_rule}
+(allow file-write* (subpath "{_escape(PROJECT_ROOT)}") (literal "/dev/null"){cache_rules})
 {git_rule}
 '''
 
@@ -44,10 +57,17 @@ def wrap(command: str) -> list[str] | None:
         args = [
             "bwrap",
             "--ro-bind", "/", "/",
+            "--tmpfs", "/tmp",  # private, writable /tmp; before the project, which may live in /tmp
             "--bind", str(PROJECT_ROOT), str(PROJECT_ROOT),
             "--dev", "/dev", "--proc", "/proc",
-            "--unshare-net", "--die-with-parent",
+            "--die-with-parent",
         ]
+        if network_enabled():
+            for cache in CACHE_DIRS:
+                cache.mkdir(parents=True, exist_ok=True)
+                args.extend(["--bind", str(cache), str(cache)])
+        else:
+            args.append("--unshare-net")
         git_dir = PROJECT_ROOT / ".git"
         if git_dir.is_dir():
             args.extend(["--ro-bind", str(git_dir), str(git_dir)])

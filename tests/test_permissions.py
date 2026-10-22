@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agent_harness.permissions import PROJECT_ROOT, check, decide, inside_project, split_command
+from agent_harness.permissions import PROJECT_ROOT, check, decide, inside_project, split_command, resolve_path
 
 
 class PermissionPolicyTests(unittest.TestCase):
@@ -96,6 +96,11 @@ class PermissionPolicyTests(unittest.TestCase):
             self.assertEqual(check("write_file", {"path": target, "conteudo": "x"})[0], "deny")
             self.assertEqual(check("str_replace", {"path": target, "old": "x", "new": "y"})[0], "deny")
 
+    def test_absolute_path_that_only_makes_sense_inside_the_project(self):
+        self.assertEqual(resolve_path("/src/agent_harness/ui.py"), PROJECT_ROOT / "src/agent_harness/ui.py")
+        self.assertEqual(resolve_path("/novo_arquivo.py"), PROJECT_ROOT / "novo_arquivo.py")  # new file at the root
+        self.assertEqual(resolve_path("/etc/hostname"), Path("/etc/hostname"))                 # exists: stays outside
+        self.assertEqual(resolve_path("/tmp/nao/existe.py"), Path("/tmp/nao/existe.py"))   
 
 if __name__ == "__main__":
     unittest.main()

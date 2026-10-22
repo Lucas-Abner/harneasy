@@ -57,12 +57,10 @@ class SearchToolTests(WorkspaceTestCase):
 class EditSafetyTests(WorkspaceTestCase):
     def test_edit_requires_prior_read(self):
         app = str(self.root / "src" / "app.py")
-        self.assertIn("leia", self.run_tool("str_replace", path=app, old_str="hello", new_str="oi"))
-        self.assertIn("leia", self.run_tool("write_file", path=app, content="x"))
-        self.run_tool("read_file", path=app)
-        self.assertIn("Substituído", self.run_tool("str_replace", path=app, old_str="hello", new_str="oi"))
-        # Our own edit keeps the file "fresh": a second edit needs no new read.
-        self.assertIn("Substituído", self.run_tool("str_replace", path=app, old_str="oi", new_str="olá"))
+        first = self.run_tool("str_replace", path=app, old_str="hello", new_str="oi")
+        self.assertIn("edição não aplicada", first)
+        self.assertIn("return 'hello'", first)  # the content came with the error
+        self.assertIn("Substituído", self.run_tool("str_replace", path=app, old_str="hello", new_str="oi"))  # retry works
 
     def test_external_change_after_read_is_detected(self):
         app = self.root / "src" / "app.py"
@@ -98,6 +96,18 @@ class EditSafetyTests(WorkspaceTestCase):
         self.assertIn("voltou", undo_last_edit())
         self.assertEqual(app.read_text(), original)
         self.assertEqual(undo_last_edit(), "Nada para desfazer.")
+
+    def test_paging_through_a_file_is_not_a_repeat(self):
+        app = str(self.root / "src" / "app.py")
+        self.run_tool("read_file", path=app)
+        self.assertNotIn("Você já leu", self.run_tool("read_file", path=app, start_line=121))
+        self.assertIn("Você já leu", self.run_tool("read_file", path=app, start_line=50))
+
+    def test_cat_counts_as_a_read_of_that_file(self):
+        app = str(self.root / "src" / "app.py")
+        self.run_tool("read_file", path=app)
+        self.assertIn("Você já leu", self.run_tool("bash", command=f"cat {app}"))
+        self.assertNotIn("Você já leu", self.run_tool("bash", command=f"cat {app} | wc -l"))
 
 
 if __name__ == "__main__":

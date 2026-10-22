@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .permissions import PROJECT_ROOT
+from .sandbox import network_enabled
 from .todos import todos_prompts
 
 SEEN: dict[str, float] = {}
@@ -101,6 +102,7 @@ def reminder() -> dict[str, str]:
             f"time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"workspace: {PROJECT_ROOT}\n"
             f"git branch: {git_branch() or 'indisponível'}\n"
+            f"rede: {'ligada (instalar pacotes pede permissão)' if network_enabled() else 'desligada (não instale pacotes)'}\n"
             "</env>"
             + plan_note()
             + todos_note()

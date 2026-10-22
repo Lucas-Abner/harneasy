@@ -270,6 +270,10 @@ def run_request(
     nudges = 0
     verifications = 0
     files_changed = False
+    idle_limit = max(3, int(os.getenv('HARNEASY_IDLE_LIMIT', '6')))
+    idle_calls = 0
+    idle_warned = False
+    last_failed_tests: str | None = None
 
     try:
         for turn in range(max_turns):
@@ -306,6 +310,14 @@ def run_request(
                     messages.append({"role": "user", "content": (
                         "<system-reminder>Ainda há problemas:\n- " + "\n- ".join(problems)
                         + "\nCorrija antes de encerrar.</system-reminder>"
+                    )})
+                    continue
+                if last_failed_tests and nudges < max_nudges:
+                    nudges += 1
+                    messages.append({"role": "user", "content": (
+                        "<system-reminder>A última execução dos testes falhou e não foi repetida com sucesso:\n"
+                        f"{last_failed_tests[-2000:]}\n"
+                        "Corrija o código e rode os testes de novo antes de encerrar.</system-reminder>"
                     )})
                     continue
                 # 2) The project's tests.
@@ -370,7 +382,30 @@ def run_request(
                             repeated_calls.clear()
                             files_changed = True
                             edited_paths.add(args["path"])
+                        if name == "bash" and "pytest" in str(args.get("command", "")):
+                            failed = "[processo finalizado com código" in result
+                            not_a_test_failure = "no tests ran" in result or "No module named pytest" in result
+                            last_failed_tests = result if failed and not not_a_test_failure else None
 
+                made_progress = name in EDIT_TOOLS or name == 'update_todos'
+                if made_progress and not str(result).startswith('Erro'):
+                    idle_calls, idle_warned = 0, False
+                else:
+                    idle_calls += 1
+
+                if idle_calls >= 2 * idle_limit:
+                    ui.console.print(
+                        f'[yellow]O agente fez {idle_calls} ações seguidas sem progresso e foi parado.[/yellow]')
+                    return messages, 'stuck'
+                if idle_calls >= idle_limit and not idle_warned:
+                    idle_warned = True
+                    messages.append({"role": "user", "content": (
+                        f"<system-reminder>Você fez {idle_calls} ações seguidas sem editar arquivos nem "
+                        "avançar a lista de tarefas. Pare de investigar. Faça agora UMA destas: "
+                        "(a) edite o arquivo que precisa mudar; (b) marque a tarefa como concluída; "
+                        "(c) se ela não pode ser feita neste ambiente, explique o motivo e encerre."
+                        "</system-reminder>"
+                    )})
                 ui.show_tool_call(name, args, result)
                 if name == "update_todos":
                     ui.show_todos(todos())
