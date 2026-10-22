@@ -6,6 +6,7 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
+from .codeindex import walk_files
 from .permissions import PROJECT_ROOT
 from .sandbox import network_enabled
 from .todos import todos_prompts
@@ -92,6 +93,16 @@ def plan_note() -> str:
     return f"\n{PLAN_FILE}: {done}/{len(steps)} etapas concluídas.{next_step}"
 
 
+def project_files(limit: int = 40) -> str:
+    """List the project's files, so the model does not spend actions discovering them."""
+    files = []
+    for path in walk_files(PROJECT_ROOT):
+        files.append(f"{path.relative_to(PROJECT_ROOT)} ({path.stat().st_size} bytes)")
+        if len(files) > limit:
+            return ""  # big project: the list would cost more than it saves
+    return "files:\n" + "\n".join(f"  {name}" for name in files) + "\n"
+
+
 def reminder() -> dict[str, str]:
     changed = states_file()
     changed_note = "\nArquivos lidos e alterados desde então: " + ", ".join(changed) if changed else ""
@@ -107,5 +118,6 @@ def reminder() -> dict[str, str]:
             + plan_note()
             + todos_note()
             + changed_note
+            + project_files()
         ),
     }

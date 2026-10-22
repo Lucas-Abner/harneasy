@@ -5,6 +5,7 @@ import os
 import sys
 from collections.abc import Callable
 from typing import Any
+from pathlib import Path
 
 from rich.console import Console, Group
 from rich.live import Live
@@ -270,10 +271,11 @@ def run_request(
     nudges = 0
     verifications = 0
     files_changed = False
-    idle_limit = max(3, int(os.getenv('HARNEASY_IDLE_LIMIT', '6')))
-    idle_calls = 0
+    idle_limit = max(3, int(os.getenv("HARNEASY_IDLE_LIMIT", "6")))
+    idle_calls = 0  # tool calls in a row without editing a file or updating the todo list
     idle_warned = False
     last_failed_tests: str | None = None
+    read_paths: set[str] = set()  # files read in this request; a first read is not wandering
 
     try:
         for turn in range(max_turns):
@@ -387,25 +389,15 @@ def run_request(
                             not_a_test_failure = "no tests ran" in result or "No module named pytest" in result
                             last_failed_tests = result if failed and not not_a_test_failure else None
 
-                made_progress = name in EDIT_TOOLS or name == 'update_todos'
-                if made_progress and not str(result).startswith('Erro'):
+                made_progress = name in EDIT_TOOLS or name == "update_todos"
+                new_file = name == "read_file" and args.get("path") not in read_paths
+                if name == "read_file":
+                    read_paths.add(args.get("path"))
+                if made_progress and not str(result).startswith("Erro"):
                     idle_calls, idle_warned = 0, False
-                else:
+                elif not new_file:
                     idle_calls += 1
 
-                if idle_calls >= 2 * idle_limit:
-                    ui.console.print(
-                        f'[yellow]O agente fez {idle_calls} ações seguidas sem progresso e foi parado.[/yellow]')
-                    return messages, 'stuck'
-                if idle_calls >= idle_limit and not idle_warned:
-                    idle_warned = True
-                    messages.append({"role": "user", "content": (
-                        f"<system-reminder>Você fez {idle_calls} ações seguidas sem editar arquivos nem "
-                        "avançar a lista de tarefas. Pare de investigar. Faça agora UMA destas: "
-                        "(a) edite o arquivo que precisa mudar; (b) marque a tarefa como concluída; "
-                        "(c) se ela não pode ser feita neste ambiente, explique o motivo e encerre."
-                        "</system-reminder>"
-                    )})
                 ui.show_tool_call(name, args, result)
                 if name == "update_todos":
                     ui.show_todos(todos())
@@ -414,6 +406,23 @@ def run_request(
                     "tool_call_id": tool_call.id,
                     "content": str(result),
                 })
+
+            # Wandering: many actions in a row and nothing changed.
+            # Checked after the loop, so every tool call already has its result.
+            if idle_calls >= 2 * idle_limit:
+                ui.console.print(
+                    f"[yellow]O agente fez {idle_calls} ações seguidas sem progresso e foi parado.[/yellow]"
+                )
+                return messages, "stuck"
+            if idle_calls >= idle_limit and not idle_warned:
+                idle_warned = True
+                already_read = ", ".join(sorted(Path(p).name for p in read_paths)) or "nenhum"
+                messages.append({"role": "user", "content": (
+                    f"<system-reminder>Você fez {idle_calls} ações seguidas sem editar arquivos. "
+                    f"Você já leu: {already_read}. Isso basta para começar. "
+                    "Na PRÓXIMA resposta, chame write_file ou str_replace com a mudança pedida. "
+                    "Se não for possível, explique o motivo e encerre.</system-reminder>"
+                )})
 
             try:
                 if needed(usage or {}, messages):

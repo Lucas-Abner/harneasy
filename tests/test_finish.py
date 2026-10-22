@@ -158,6 +158,12 @@ class DefaultVerifyTests(unittest.TestCase):
             messages, _ = run_with(scripted_llm(steps), "tarefa", HARNEASY_FINAL_REVIEW="0")
         self.assertIn("estagnação", [m for m in messages if m["role"] == "tool"][-1]["content"])
 
+    def test_reading_new_files_is_not_wandering(self):
+        steps = [("read_file", {"path": f"arquivo{i}.py"}) for i in range(15)] + [None]
+        with mock.patch("agent_harness.ui.execute_tool", return_value="conteúdo"):
+            _, status = run_with(scripted_llm(steps), "tarefa", HARNEASY_IDLE_LIMIT="3", HARNEASY_FINAL_REVIEW="0")
+        self.assertEqual(status, "done")
+
 
 if __name__ == "__main__":
     unittest.main()

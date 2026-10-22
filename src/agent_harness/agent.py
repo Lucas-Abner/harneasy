@@ -48,11 +48,16 @@ Skills disponíveis:
 
 
 def check_context_window() -> str | None:
-    """Clamp the compaction window to the context Ollama really allocated."""
+    """Match the compaction window to the context Ollama really allocated."""
     model = os.getenv("OPENAI_MODEL", "ornith-1.5:9b")
     detected = ollama_context_length(model)
     configured = compact.CONTEXT_WINDOWS
-    if detected is None or detected >= configured:
+    if detected is None:
+        return None
+    if detected > configured and "HARNEASY_CONTEXT_WINDOW" not in os.environ:
+        compact.CONTEXT_WINDOWS = detected  # Ollama gave more room than the default: use it
+        return None
+    if detected >= configured:
         return None
     compact.CONTEXT_WINDOWS = detected
     return (

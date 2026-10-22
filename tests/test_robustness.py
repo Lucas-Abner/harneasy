@@ -121,9 +121,22 @@ class OllamaContextTests(unittest.TestCase):
         with mock.patch.object(llm, "_ollama_get", side_effect=OSError("404")):
             self.assertIsNone(llm.ollama_context_length("any"))
 
+    def test_window_grows_to_what_ollama_allocated_when_not_configured(self):
+        original = compact.CONTEXT_WINDOWS
+        try:
+            compact.CONTEXT_WINDOWS = 4200
+            env = {k: v for k, v in os.environ.items() if k != "HARNEASY_CONTEXT_WINDOW"}
+            with mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(agent, "ollama_context_length", return_value=10000):
+                self.assertIsNone(agent.check_context_window())
+            self.assertEqual(compact.CONTEXT_WINDOWS, 10000)
+        finally:
+            compact.CONTEXT_WINDOWS = original
+
     def test_window_is_clamped_only_when_ollama_allocated_less(self):
         original = compact.CONTEXT_WINDOWS
         try:
+            self.enterContext(mock.patch.dict(os.environ, {"HARNEASY_CONTEXT_WINDOW": "4200"}))
             compact.CONTEXT_WINDOWS = 4200
             with mock.patch.object(agent, "ollama_context_length", return_value=4096):
                 warning = agent.check_context_window()
