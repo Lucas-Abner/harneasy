@@ -62,6 +62,14 @@ class EditSafetyTests(WorkspaceTestCase):
         self.assertIn("return 'hello'", first)  # the content came with the error
         self.assertIn("Substituído", self.run_tool("str_replace", path=app, old_str="hello", new_str="oi"))  # retry works
 
+    def test_standard_module_used_without_import_is_reported(self):
+        missing = str(self.root / "slug.py")
+        warning = self.run_tool("write_file", path=missing, content="def f(t):\n    return re.sub('a', 'b', t)\n")
+        self.assertIn("usa re sem importar", warning)
+        fine = str(self.root / "slug_ok.py")
+        content = "import re\n\ndef f(t, os=None):\n    return re.sub('a', 'b', t)\n"
+        self.assertNotIn("sem importar", self.run_tool("write_file", path=fine, content=content))
+
     def test_external_change_after_read_is_detected(self):
         app = self.root / "src" / "app.py"
         self.run_tool("read_file", path=str(app))

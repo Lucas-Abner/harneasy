@@ -196,6 +196,24 @@ def close_dangling_tool_calls(messages: list[dict[str, Any]]) -> None:
             return
 
 
+def split_request(call_llm: Callable[..., Any], request: str) -> str:
+    """Ask the model, without tools, for the parts of the request; "" if it is a single part.
+
+    Small models often do the first part and stop, so the parts are shown to them up front.
+    """
+    question = (
+        "Liste as partes que precisam ser feitas neste pedido, uma por linha, começando com '- '. "
+        "No máximo 5. Não resolva nada agora.\n\nPedido: " + request
+    )
+    try:
+        message, *_ = call_llm([{"role": "user", "content": question}], tools=[])
+    except Exception:
+        return ""
+    lines = [line.strip() for line in (message.content or "").splitlines()]
+    parts = [line for line in lines if line.startswith(("-", "*")) or line[:1].isdigit()]
+    return "\n".join(parts[:5]) if len(parts) > 1 else ""
+
+
 def nudge_for(content: str | None, open_todos: bool, todo_list: str) -> str | None:
     """Return a reminder when the model ends its turn too early, else None."""
     if not (content or "").strip():
@@ -254,6 +272,7 @@ def run_request(
     max_nudges = max(0, int(os.getenv("HARNEASY_MAX_NUDGES", "2")))
     final_review = os.getenv("HARNEASY_FINAL_REVIEW", "1") not in {"0", "false", "no"}
     auto_skills = os.getenv("HARNEASY_AUTO_SKILLS", "1") not in {"0", "false", "no"}
+    split = os.getenv("HARNEASY_SPLIT_REQUEST", "1") not in {"0", "false", "no"}
     max_verifications = max(0, int(os.getenv("HARNEASY_MAX_VERIFY", "2")))
 
     content = user_input
@@ -262,6 +281,11 @@ def run_request(
         # Small models rarely read skills on their own, so the harness picks one.
         ui.console.print(f"[dim]skill: {skill}[/dim]")
         content += f"\n\n<skill name=\"{skill}\">\n{skill_body(skill)}\n</skill>\nSiga os passos desta skill."
+    # Only for requests that picked a skill: a chat message has nothing to split.
+    parts = split_request(call_llm, user_input) if skill and split else ""
+    if parts:
+        ui.console.print(f"[dim]partes do pedido:\n{parts}[/dim]")
+        content += f"\n\nPartes do pedido (faça todas, uma por vez):\n{parts}"
     messages.append({"role": "user", "content": content})
     undo_mark = len(UNDO_STACK)
     edited_paths: set[str] = set()
@@ -275,6 +299,7 @@ def run_request(
     idle_calls = 0  # tool calls in a row without editing a file or updating the todo list
     idle_warned = False
     last_failed_tests: str | None = None
+    last_search: dict | None = None  # the model's last grep; checked again before it finishes
     read_paths: set[str] = set()  # files read in this request; a first read is not wandering
 
     try:
@@ -322,6 +347,18 @@ def run_request(
                         "Corrija o código e rode os testes de novo antes de encerrar.</system-reminder>"
                     )})
                     continue
+                # The model searched for something; does the search still find it?
+                if last_search and files_changed and nudges < max_nudges:
+                    still_found = execute_tool("grep", last_search)
+                    last_search = None
+                    if not still_found.startswith(("Nenhuma ocorrência", "Erro")):
+                        nudges += 1
+                        messages.append({"role": "user", "content": (
+                            "<system-reminder>Sua última busca ainda encontra resultados:\n"
+                            f"{still_found[:1500]}\n"
+                            "Se eles deveriam ter mudado, corrija antes de encerrar.</system-reminder>"
+                        )})
+                        continue
                 # 2) The project's tests.
                 command = verify_command()
                 if command and files_changed and verifications < max_verifications:
@@ -336,8 +373,10 @@ def run_request(
                     reviewed = True
                     messages.append({"role": "user", "content": (
                         f"<system-reminder>Revisão final. O pedido foi:\n{user_input}\n\n"
+                        + (f"Partes do pedido:\n{parts}\n\n" if parts else "") +
                         f"Alterações feitas (diff real):\n{changes_since(undo_mark)}\n\n"
-                        "Compare o pedido com o diff, item por item. Se faltar algo, continue usando as "
+                        f"Arquivos como estão agora:\n{''.join(execute_tool('read_file', {'path': p})[:3000] for p in edited_paths)}\n\n"
+                        "Compare o pedido com o diff e com os arquivos, item por item. Se faltar algo, continue usando as "
                         "ferramentas. Se estiver completo, responda só o resumo final.</system-reminder>"
                     )})
                     continue
@@ -388,7 +427,8 @@ def run_request(
                             failed = "[processo finalizado com código" in result
                             not_a_test_failure = "no tests ran" in result or "No module named pytest" in result
                             last_failed_tests = result if failed and not not_a_test_failure else None
-
+                        if name == "grep" and not str(result).startswith("Erro"):
+                            last_search = dict(args)
                 made_progress = name in EDIT_TOOLS or name == "update_todos"
                 new_file = name == "read_file" and args.get("path") not in read_paths
                 if name == "read_file":
@@ -401,6 +441,7 @@ def run_request(
                 ui.show_tool_call(name, args, result)
                 if name == "update_todos":
                     ui.show_todos(todos())
+                
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,

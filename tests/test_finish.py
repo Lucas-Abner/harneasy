@@ -6,6 +6,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from openai.types.chat import ChatCompletionMessage
+
 from agent_harness import context
 from agent_harness.permissions import PROJECT_ROOT
 from agent_harness.skills import skill_body, suggest_skill
@@ -51,7 +53,7 @@ class SkillRoutingTests(unittest.TestCase):
 def run_with(call_llm, request, **env):
     from agent_harness.ui import run_request
 
-    settings = {"HARNEASY_VERIFY_COMMAND": "off", **env}
+    settings = {"HARNEASY_VERIFY_COMMAND": "off", "HARNEASY_SPLIT_REQUEST": "0", **env}
     with mock.patch.dict(os.environ, settings):
         return run_request(
             fake_ui(), [{"role": "system", "content": "s"}], request,
@@ -108,6 +110,21 @@ class FinishCheckTests(unittest.TestCase):
         self.assertIn('+{"debug": false}', review)
         self.assertEqual(status, "done")
 
+    def test_request_with_several_parts_is_split_first(self):
+        replies = iter([
+            ChatCompletionMessage(role="assistant", content="Partes:\n- desligar o debug\n- adicionar port 8080"),
+            ChatCompletionMessage(role="assistant", content="pronto"),
+        ])
+        calls = []
+
+        def call_llm(messages, **kwargs):
+            calls.append(kwargs)
+            return next(replies), {}, None, None
+
+        messages, _ = run_with(call_llm, "Desligue o debug e adicione port 8080", HARNEASY_SPLIT_REQUEST="1")
+        self.assertEqual(calls[0]["tools"], [])  # the split call can't use tools
+        self.assertIn("- desligar o debug\n- adicionar port 8080", messages[1]["content"])
+
     def test_no_edits_means_no_review(self):
         messages, _ = run_with(scripted_llm([None]), "o que é isso?")
         self.assertEqual(reminders(messages, "Revisão final"), [])
@@ -143,6 +160,18 @@ class DefaultVerifyTests(unittest.TestCase):
         with mock.patch("agent_harness.ui.execute_tool", return_value=failing):
             messages, _ = run_with(scripted_llm(steps), "corrija os testes", HARNEASY_FINAL_REVIEW="0")
         self.assertEqual(len(reminders(messages, "testes falhou")), 2)  # insists twice, then gives up
+
+    def test_finishing_while_the_last_search_still_finds_matches_is_refused(self):
+        def fake_tool(name, args, **kwargs):
+            return "jobs.py:5: users.get_user(i)" if name == "grep" else "Arquivo escrito: api.py"
+
+        steps = [("grep", {"pattern": "get_user"}), ("write_file", {"path": "api.py", "content": "x"}), None, None]
+        with mock.patch("agent_harness.ui.execute_tool", side_effect=fake_tool), \
+                mock.patch("agent_harness.ui.pending_problems", return_value=[]):
+            messages, _ = run_with(scripted_llm(steps), "renomeie get_user", HARNEASY_FINAL_REVIEW="0")
+        found = reminders(messages, "ainda encontra")
+        self.assertEqual(len(found), 1)  # checked once, then the model may explain
+        self.assertIn("jobs.py:5", found[0])
 
     def test_wandering_without_progress_is_stopped(self):
         steps = [("bash", {"command": f"echo {i}"}) for i in range(20)]

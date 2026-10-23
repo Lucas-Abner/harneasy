@@ -202,11 +202,26 @@ def _require_fresh_read(resolved: Path) -> str | None:
             f"Conteúdo atual abaixo. Confira e REPITA a mesma chamada.\n{content}"
             )
     if resolved.stat().st_mtime > read_mtime:
-        return f"Erro: {resolved} mudou desde a última leitura. Leia-o novamente antes de editar."
+        return f"Erro: {resolved} mudou desde a última leitura. Chame read_file nele de novo e depois repita a edição."
     return None
 
 
+COMMENTS = re.compile(r'<!--.*?-->|/\*.*?\*/|//[^\n]*|#[^\n]*', re.DOTALL)
+
+
+def _only_cosmetic(before: str, after: str) -> bool:
+    def bare(text: str) -> str:
+        return "".join(COMMENTS.sub("", text).split())
+
+    return before != after and bare(before) == bare(after)
+
+
 def _short_diff(old_text: str, new_text: str) -> str:
+    if _only_cosmetic(old_text, new_text):
+        return (
+            "\n[Aviso: esta edição só mudou comentários ou espaços; o código ficou igual. "
+            "O pedido ainda não foi feito. Faça a mudança real, uma parte por vez.]"
+        )
     lines = list(difflib.unified_diff(
         old_text.splitlines(), new_text.splitlines(), lineterm="", n=1,
     ))[2:]  # skip the ---/+++ header
@@ -243,6 +258,12 @@ def _missing_imports(tree: ast.AST, resolved: Path) -> list[str]:
             missing.append(name)
     return missing
 
+def _unimported_modules(text: str) -> list[str]:
+    """Standard modules used as `re.sub(...)` but never imported."""
+    used = set(re.findall(r"\b([a-z_]+)\.", text))
+    return sorted(name for name in used & sys.stdlib_module_names
+              if not re.search(rf"^\s*(import|from)\s.*\b{name}\b", text, re.MULTILINE))
+
 
 def _syntax_warning(resolved: Path) -> str:
     """Check the syntax of common file types right after an edit."""
@@ -250,7 +271,12 @@ def _syntax_warning(resolved: Path) -> str:
     suffix = resolved.suffix.lower()
     try:
         if suffix == ".py":
-            missing = _missing_imports(ast.parse(text, filename=str(resolved)), resolved)
+            tree = ast.parse(text, filename=str(resolved))
+            unimported = _unimported_modules(text)
+            if unimported:
+                imports = "; ".join(f"import {name}" for name in unimported)
+                return f"\n[Aviso: o código usa {', '.join(unimported)} sem importar. Acrescente no topo: {imports}]"
+            missing = _missing_imports(tree, resolved)
             if missing:
                 advice = (
                     "instale com `uv add` se precisar deles" if sandbox.network_enabled()
@@ -335,6 +361,8 @@ def write_file(path: str, content: str) -> str:
     resolved = _resolve(path)
     if not isinstance(content, str):
         raise TypeError("'content' precisa ser uma string.")
+    if resolved.exists() and len(resolved.read_text(encoding="utf-8").splitlines()) > 30:
+        return f"Erro: {resolved} tem mais de 30 linhas. Use str_replace para editar só o trecho necessário."
     error = _require_fresh_read(resolved)
     if error:
         return error
@@ -386,7 +414,10 @@ def _closest_snippet(lines: list[str], old_lines: list[str]) -> str:
 
 def str_replace(path: str, old_str: str, new_str: str, allow_multi_edit: bool = False) -> str:
     if not old_str:
-        return "Erro: a string antiga não pode ser vazia."
+        return (
+            "Erro: a string antiga não pode ser vazia. Para adicionar texto, use como old_str a linha "
+            "que vem antes e repita essa linha no new_str, com a novidade embaixo."
+        )
 
     resolved = _resolve(path)
     error = _require_fresh_read(resolved)
@@ -401,7 +432,8 @@ def str_replace(path: str, old_str: str, new_str: str, allow_multi_edit: bool = 
     if count > 1 and not allow_multi_edit:
         return (
             f"Erro: o texto aparece {count} vezes em {resolved}. "
-            "Inclua mais linhas de contexto ou informe allow_multi_edit=true."
+            "Copie também a linha de cima ou de baixo para o trecho ficar único. "
+            "Se quiser trocar todas, use allow_multi_edit=true."
         )
     if count >= 1:
         noun = "ocorrência" if count == 1 else "ocorrências"
@@ -422,7 +454,7 @@ def str_replace(path: str, old_str: str, new_str: str, allow_multi_edit: bool = 
         if len(matches) > 1:
             return (
                 f"Erro: o texto aparece {len(matches)} vezes em {resolved} ({label}). "
-                "Inclua mais linhas de contexto para torná-lo único."
+                "Copie também a linha de cima ou de baixo para o trecho ficar único."
             )
         if len(matches) == 1:
             start = matches[0]
@@ -437,7 +469,7 @@ def str_replace(path: str, old_str: str, new_str: str, allow_multi_edit: bool = 
 
     # 3. No match: show the closest snippet so the model can fix its next try.
     return (
-        f"Erro: texto não encontrado em {resolved}. Copie old_str exatamente do arquivo."
+        f"Erro: texto não encontrado em {resolved}. Copie old_str exatamente do arquivo, sem os números das linhas."
         + _closest_snippet(lines, old_lines)
     )
 
@@ -477,7 +509,7 @@ def grep(pattern: str, path: str = ".", include: str | None = None, ignore_case:
     try:
         regex = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
     except re.error as error:
-        return f"Erro: expressão regular inválida: {error}"
+        return f"Erro: expressão regular inválida: {error}. Para buscar o texto literal, coloque \\ antes de ( ) [ ] . * + ?"
     base = _resolve(path)
     files = [base] if base.is_file() else walk_files(base)
     matches: list[str] = []
@@ -501,7 +533,7 @@ def grep(pattern: str, path: str = ".", include: str | None = None, ignore_case:
 def list_dir(path: str = ".") -> str:
     base = _resolve(path)
     if not base.is_dir():
-        return f"Erro: {base} não é um diretório."
+        return f"Erro: {base} não é um diretório. Se for um arquivo, use read_file; para achar a pasta, use glob."
     entries = sorted(base.iterdir(), key=lambda item: (not item.is_dir(), item.name))
     lines = []
     for item in entries[:MAX_SEARCH_RESULTS]:
@@ -707,7 +739,10 @@ def execute_tool(
         else:
             result = function(**args)
     except subprocess.TimeoutExpired as error:
-        result = f"Erro: o comando excedeu o limite de {error.timeout} segundos e foi encerrado."
+        result = (
+            f"Erro: o comando excedeu o limite de {error.timeout} segundos e foi encerrado. "
+            "Não rode servidores nem comandos que esperam entrada; use um comando que termine sozinho."
+        )
     except Exception as error:  # A tool error should be returned to the model for recovery.
         result = f"Erro na ferramenta {name}: {type(error).__name__}: {error}"
 
@@ -756,7 +791,7 @@ TOOLS_SCHEMAS = [
            "max_lines": {"type": "integer", "minimum": 1, "maximum": 500}},
           ["path"]),
     _tool("read_skill", "Lê as instruções de uma skill pelo nome.", {"name": STRING}, ["name"]),
-    _tool("write_file", "Cria ou sobrescreve um arquivo inteiro.",
+    _tool("write_file", "Cria um arquivo ou reescreve um arquivo de até 30 linhas. Para arquivos maiores, use str_replace.",
           {"path": STRING, "content": STRING}, ["path", "content"]),
     _tool("str_replace", "Substitui old_str por new_str em um arquivo. old_str deve ser único e copiado do arquivo.",
           {"path": STRING, "old_str": STRING, "new_str": STRING,

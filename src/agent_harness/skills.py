@@ -68,8 +68,11 @@ def suggest_skill(request: str) -> str | None:
     comes first).
     """
     text = normalize(request)
+    short = len(text.split()) <= 4
     best: tuple[int, int, str] | None = None
     for name, info in SKILLS.items():
+        if name == 'retomar-trabalho' and not short:
+            continue
         positions = [text.find(trigger) for trigger in info.get("triggers", []) if trigger in text]
         if not positions:
             continue
